@@ -1,0 +1,23 @@
+{
+  "job": {
+    "schema_version": 2, "name": "train", "parameters": {"steps": 2},
+    "artifacts": {"inputs": {}, "outputs": {"checkpoint": {"path": "checkpoint", "destination": null, "required": true}}},
+    "reproducibility": {"contract": "environment-inputs", "seed": 42},
+    "targets": {"local": {
+      "name": "local", "system": "x86_64-linux", "executor": "native",
+      "accelerator": {"id": "cpu", "count": 1, "min_memory_mib": 0, "architectures": [], "driver_range": null, "runtime_version": null, "topology": {}},
+      "resources": {"cpu_cores": null, "memory_mib": null, "enforce": false},
+      "execution": {"network": "host", "isolation": "none", "timeout_seconds": 1, "env": {}}
+    }}
+  },
+  "target": {
+    "name": "local", "system": "x86_64-linux", "executor": "native",
+    "accelerator": {"id": "cpu", "count": 1, "min_memory_mib": 0, "architectures": [], "driver_range": null, "runtime_version": null, "topology": {}},
+    "resources": {"cpu_cores": null, "memory_mib": null, "enforce": false},
+    "execution": {"network": "host", "isolation": "none", "timeout_seconds": 1, "env": {}},
+    "program_output": "computePrograms.train.local", "program": "/nix/store/fixture-trainer",
+    "entrypoint": ["/nix/store/fixture-trainer/bin/trainer", "--steps", "2"],
+    "probe_output": null, "probe": null, "image_output": null, "image_name": "fixture:job",
+    "runtime_output": null, "runtime_paths": []
+  }
+}

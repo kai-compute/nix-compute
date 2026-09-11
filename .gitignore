@@ -1,0 +1,8 @@
+.devenv/
+.direnv/
+target/
+result
+result-*
+*.swp
+.nix-compute/
+__pycache__/

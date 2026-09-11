@@ -1,0 +1,28 @@
+{
+  "nix.enableLanguageServer": true,
+  "nix.serverPath": [
+    "direnv",
+    "exec",
+    "${workspaceFolder}",
+    "nix-lsp"
+  ],
+  "nix.serverSettings": {
+    "nixd": {
+      "nixpkgs": {
+        "expr": "(import (builtins.toPath \"${workspaceFolder}/.devenv/nixd.nix\")).pkgs"
+      },
+      "options": {
+        "devenv": {
+          "expr": "(import (builtins.toPath \"${workspaceFolder}/.devenv/nixd.nix\")).options"
+        }
+      },
+      "formatting": {
+        "command": ["nixfmt"]
+      }
+    }
+  },
+  "[nix]": {
+    "editor.defaultFormatter": "jnoortheen.nix-ide",
+    "editor.formatOnSave": true
+  }
+}

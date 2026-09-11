@@ -1,0 +1,28 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - run: nix profile install nixpkgs#devenv
+      - run: devenv shell -- cargo fmt --check
+      - run: devenv shell -- cargo clippy --all-targets -- -D warnings
+      - run: devenv shell -- cargo test
+      - run: devenv shell -- python3 -m unittest discover -s tests -p 'test_*.py'
+      - run: devenv shell -- cargo build
+      - run: nix build .#checks.x86_64-linux.modules --no-link
+      - run: nix build .#checks.x86_64-linux.oneapi-probe --no-link
+      - name: Configure local archive imports on the test runner
+        run: |
+          if [ ! -e "$HOME/.config/containers/policy.json" ] && [ ! -e /etc/containers/policy.json ]; then
+            install -Dm644 tests/fixtures/containers-policy.json "$HOME/.config/containers/policy.json"
+          fi
+      - run: devenv shell -- bash tests/e2e.sh
+        env:
+          NIX_COMPUTE_TEST_OCI: "1"
+      - run: bash tests/hardware-smoke.sh
