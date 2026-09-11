@@ -5,7 +5,7 @@ The user Flake imports this repository as `nix-compute`, imports `nix-compute.fl
 and declares jobs under `compute.jobs`.
 
 ```nix
-inputs.nix-compute.url = "github:KAI/nix-compute";
+inputs.nix-compute.url = "github:KaiArtificialIntelligence/nix-compute";
 
 imports = [ nix-compute.flakeModule ];
 
