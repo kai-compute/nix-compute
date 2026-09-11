@@ -5,6 +5,11 @@ in
 {
   options = {
     resources = {
+      nodes = mkOption {
+        type = types.ints.positive;
+        default = 1;
+        description = "Number of homogeneous nodes; CPU, memory and accelerator counts are per node.";
+      };
       cpu_cores = mkOption {
         type = types.nullOr types.ints.positive;
         default = null;

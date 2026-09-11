@@ -1,16 +1,21 @@
 # Nix Compute
 
-Nix Compute defines reproducible compute jobs as outputs of a user-owned Nix Flake.
+Repository: [kai-compute/nix-compute](https://github.com/kai-compute/nix-compute).
+
+Nix Compute builds reproducible compute tasks as outputs of a user-owned Nix Flake.
 The user Flake imports this repository as `nix-compute`, imports `nix-compute.flakeModule`,
-and declares jobs under `compute.jobs`.
+and declares jobs under `compute.jobs`. A compute platform selects a Target and
+routes it to a Provider. The Provider allocates resources and executes the built
+task. Nix Compute itself does not schedule machines or run training during builds.
 
 ```nix
-inputs.nix-compute.url = "github:KaiArtificialIntelligence/nix-compute";
+inputs.nix-compute.url = "github:kai-compute/nix-compute";
 
 imports = [ nix-compute.flakeModule ];
 
 compute.jobs.train = {
-  artifacts.outputs.checkpoint.path = "checkpoint";
+  artifacts.inputs.dataset = { source = ./data; path = "dataset"; };
+  artifacts.outputs.model = { path = "model"; kind = "directory"; };
   targets.cpu = {
     system = "x86_64-linux";
     imports = [ nix-compute.acceleratorModules.cpu ];
@@ -24,6 +29,8 @@ compute.jobs.train = {
 
 The module generates:
 
+- `computeTasks.<job>.<target>`: a complete, cacheable task output containing
+  `task.json`, a program reference, and an image reference for OCI targets.
 - `computeJobs.<job>.targets.<target>`: execution metadata.
 - `computePrograms.<job>.<target>`: the program derivation.
 - `computeImages.<job>.<target>`: an image archive, only for OCI targets.
@@ -41,10 +48,23 @@ importing a module does not translate CUDA code to another backend. See
 [the target and probe contract](docs/protocol.md) for SDK configuration, supported
 systems, device allocation, and native execution requirements.
 
+Input `source` values are Nix derivations or paths, including directories. Declare
+downloads with fixed hashes and preprocessing as derivations. Programs and inputs
+are built once and distributed through ordinary Nix binary caches. Data remains
+independent of OCI images and can be reused across targets.
+
+`resources.nodes` defaults to one. CPU, memory, and `accelerator.count` are per
+node; `accelerator.min_memory_mib` is per device. A target with two nodes and eight
+accelerators requests two homogeneous eight-device nodes. Different targets are
+alternative implementations, not separate nodes of one cluster.
+
 Programs read `NIX_COMPUTE_INPUTS` and write `NIX_COMPUTE_OUTPUTS`; artifact paths
 are relative to those directories. Parameters are JSON in
 `NIX_COMPUTE_PARAMETERS`, and a declared seed is available as `NIX_COMPUTE_SEED`.
-Required outputs must exist as files inside the output directory.
+Outputs declare `kind = "file"` or `"directory"` and `scope = "leader"` or
+`"per-node"`. Defaults are file and leader. The provider supplies node rank,
+node count and rendezvous information; the locked entrypoint launches the chosen
+distributed framework. See [the Provider contract](docs/protocol.md).
 
 Development uses Devenv (2.0 or newer) and Direnv. Install both, then run
 `direnv allow` in the repository. The development shell provides Rust, Nix, jq,
@@ -69,48 +89,85 @@ The standalone `nix develop` shell also includes `nixd` and `nixfmt`;
 `nix fmt` uses the same formatter. The VS Code configuration uses Devenv for its
 project-specific option completions.
 
+## Repository Migration
+
+For an existing checkout, update the remote:
+
+```sh
+git remote set-url origin https://github.com/kai-compute/nix-compute
+```
+
+For downstream Flakes, use `github:kai-compute/nix-compute` for the
+`nix-compute` input, then refresh its lock entry with
+`nix flake update nix-compute`. Review the resulting revision change before
+committing `flake.lock`. The fixtures in this repository use local path inputs
+so they continue to test the current checkout.
+
 ## CLI
+
+Run the CLI directly from the repository:
+
+```sh
+nix run github:kai-compute/nix-compute -- --help
+nix run github:kai-compute/nix-compute#provider-reference -- --help
+```
+
+From a local checkout:
 
 ```sh
 nix run . -- inspect ./examples/fixture#train
 nix run . -- inspect ./examples/fixture#train --target local
 nix run . -- build ./examples/fixture#train --target local
-nix run . -- capabilities
-nix run . -- keygen .nix-compute/center-key.json
-nix run . -- run ./examples/fixture#train --target local \
-  --signing-key .nix-compute/center-key.json
+nix build ./examples/fixture#computeTasks.train.local
 ```
 
 `inspect` lists target summaries without evaluating programs or SDKs. `inspect
---target` resolves the selected target. `build --target` delegates cross-system
-builds to Nix. `run` can select automatically only when exactly one declared target
-matches the host and device requirements; zero or multiple matches are errors.
-A CPU target must be explicitly declared.
+--target` resolves the selected target. `validate` uses the same contract checks.
+`build --target` builds the complete task closure and delegates cross-system builds
+to Nix. Multiple targets require explicit selection. None of these commands
+requires the requested accelerator on the build host.
 
-Runs archive the submitted source, require `flake.lock`, and evaluate/build from
-that immutable snapshot with lock updates disabled. Attestations bind the common
-job to that source and bind the target to its backend, requirements, program and
-NAR closure digests. They also record allocated devices, driver/runtime versions,
-image digests, artifacts, timestamps and failures. Ed25519 signatures authenticate
-the center's report; they are not hardware remote attestation or evidence that an
-untrusted center performed the reported work. Numerical results need not be
-bitwise identical across runs or hardware.
+The CLI archives submitted sources, requires `flake.lock`, and evaluates/builds
+from the same immutable snapshot with lock updates disabled. Transfer a task with
+`nix copy --to <store-or-cache> <task-store-path>`; its closure includes program,
+data, SDKs, source and applicable image. Training outputs are produced at runtime,
+not automatically reused as Nix build results.
 
-Verify offline with `nix-compute verify <attestation.json> <trust.json>`. The trust
-store format is documented in [the protocol](docs/protocol.md). Existing v1
-signature envelopes remain verifiable; v1 job metadata must migrate to `targets`
-and `perTarget`, and absolute artifact paths must become relative paths.
+## Provider Reference
+
+The independent `nix-compute-provider-reference` package consumes an already built
+task. It owns the former execution, device allocation and signing commands:
+
+```sh
+task=$(nix run . -- build ./examples/fixture#train --target local)
+nix run .#provider-reference -- keygen .nix-compute/center-key.json
+nix run .#provider-reference -- run "$task" \
+  --signing-key .nix-compute/center-key.json
+nix run .#provider-reference -- verify <attestation.json> <trust.json>
+```
+
+It does not select a Target, evaluate a user Flake or build dependencies. The
+reference multi-node implementation uses a provider-owned shared coordination
+directory for readiness, heartbeats and failure propagation. Production Providers
+may implement the same lifecycle with their own cluster managers.
+
+Task schema v3 replaces URI inputs with buildable `source` inputs. Rebuild older
+task metadata after migrating inputs. Existing signature envelope versions remain
+verifiable. See [migration and execution details](docs/protocol.md) and the
+[two-node PyTorch example](examples/fixture/README.md).
 
 ## Verification
 
 ```sh
-devenv shell -- cargo fmt --check
-devenv shell -- cargo clippy --all-targets -- -D warnings
-devenv shell -- cargo test
+devenv shell -- cargo fmt --all --check
+devenv shell -- cargo clippy --workspace --all-targets -- -D warnings
+devenv shell -- cargo test --workspace
 devenv shell -- python3 -m unittest discover -s tests -p 'test_*.py'
-devenv shell -- cargo build
+devenv shell -- cargo build --workspace
 nix build .#checks.x86_64-linux.modules --no-link
 devenv shell -- bash tests/e2e.sh
+devenv shell -- bash tests/distributed.sh
+devenv shell -- bash tests/cache.sh
 bash tests/hardware-smoke.sh
 ```
 
@@ -119,5 +176,5 @@ lifecycle and signature tests.
 The hardware smoke script explicitly reports skipped backends unless a hardware
 fixture and signing key are configured. Vendor probes and device launch arguments
 require validation on the actual center's hardware and driver stack before use.
-This repository provides a local execution MVP; scheduling, billing, provisioning
-and multi-node orchestration are outside its scope.
+Scheduling, routing, billing and provisioning belong to the compute platform and
+Providers. Company branding is not used as a component name.

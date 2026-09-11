@@ -99,6 +99,10 @@ in
   };
   config.assertions = [
     {
+      assertion = config.resources.nodes == 1 || config.execution.network == "host";
+      message = "multi-node tasks require network = host for peer connectivity";
+    }
+    {
       assertion = builtins.match "[A-Za-z0-9_-]+" targetName != null;
       message = "invalid target name ${targetName}";
     }

@@ -6,6 +6,7 @@ let
     jobs:
     (lib.evalModules {
       specialArgs.inputs.nixpkgs = pkgs.path;
+      specialArgs.inputs.self.outPath = ../.;
       modules = [
         ./flake-module.nix
         {
@@ -77,6 +78,39 @@ let
       program = pkgs.hello;
     };
   };
+  distributed = evaluate {
+    train = {
+      artifacts.inputs.dataset = {
+        source = pkgs.writeText "dataset" "cached data";
+        path = "data/train.txt";
+      };
+      artifacts.outputs.model = {
+        path = "model";
+        kind = "directory";
+        scope = "leader";
+      };
+      targets.cuda = {
+        imports = [ backends.cuda ];
+        system = "x86_64-linux";
+        resources.nodes = 2;
+        execution.network = "host";
+        accelerator = {
+          count = 8;
+          min_memory_mib = 81920;
+          architectures = [ "sm_90" ];
+          driver_range = ">=550.54.15";
+          runtime_version = "12.4";
+        };
+        program = throw "routing summary forced training program";
+      };
+    };
+  };
+  badNetwork = evaluate {
+    train.targets.local = target // {
+      resources.nodes = 2;
+    };
+  };
+  task = evaluate { train.targets.local = target; };
   backendSummary =
     id:
     let
@@ -90,6 +124,16 @@ let
     in
     output.computeJobs.train.targets.test.accelerator.id;
   checks = [
+    (flake.computeJobs.train.schema_version == 3)
+    (flake.computeJobs.train.targets.local.resources.nodes == 1)
+    (distributed.computeJobs.train.targets.cuda.resources.nodes == 2)
+    (distributed.computeJobs.train.targets.cuda.accelerator.count == 8)
+    (distributed.computeJobs.train.targets.cuda.accelerator.min_memory_mib == 81920)
+    (distributed.computeJobs.train.targets.cuda.accelerator.runtime_version == "12.4")
+    (distributed.computeJobs.train.artifacts.outputs.model.kind == "directory")
+    (lib.hasPrefix builtins.storeDir distributed.computeJobs.train.artifacts.inputs.dataset.source)
+    (!(builtins.tryEval badNetwork.computeJobs.train.targets.local.system).success)
+    (lib.isDerivation task.computeTasks.train.local)
     (summaries.apple.system == "aarch64-darwin")
     (flake.computeJobs.train.targets.local.resources.cpu_cores == 4)
     (flake.computeJobs.train.targets.local.execution.env.COMMON == "yes")

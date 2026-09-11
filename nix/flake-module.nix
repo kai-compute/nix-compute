@@ -22,7 +22,28 @@ let
       };
     };
   };
-  common = job: { inherit (job) artifacts parameters reproducibility; };
+  common = job: {
+    inherit (job) parameters reproducibility;
+    artifacts = {
+      inherit (job.artifacts) outputs;
+      inputs = lib.mapAttrs (_: input: {
+        inherit (input) path;
+        source = toString (
+          if builtins.isPath input.source then builtins.path { path = input.source; } else input.source
+        );
+      }) job.artifacts.inputs;
+    };
+  };
+  summary = target: {
+    inherit (target)
+      name
+      system
+      executor
+      accelerator
+      resources
+      execution
+      ;
+  };
   evaluated = lib.mapAttrs (
     jobName: job:
     lib.mapAttrs (
@@ -113,12 +134,46 @@ in
       assert lib.assertMsg (job.targets != { }) "compute.jobs.${name} must declare targets";
       common job
       // {
-        schema_version = 2;
+        schema_version = 3;
         inherit name;
         targets = lib.mapAttrs (metadata name) evaluated.${name};
       }
     ) config.compute.jobs;
     computePrograms = lib.mapAttrs (_: lib.mapAttrs (_: target: (checked target).program)) evaluated;
+    computeTasks = lib.mapAttrs (
+      jobName: targets:
+      lib.mapAttrs (
+        targetName: raw:
+        let
+          target = checked raw;
+          pkgs = import inputs.nixpkgs {
+            system = target.system;
+            config.allowUnfree = true;
+          };
+          resolved = metadata jobName targetName target;
+          image =
+            if target.executor == "oci" then config.flake.computeImages.${jobName}.${targetName} else null;
+          manifest = {
+            schema_version = 3;
+            source = toString inputs.self.outPath;
+            job = common config.compute.jobs.${jobName} // {
+              schema_version = 3;
+              name = jobName;
+              targets.${targetName} = summary resolved;
+            };
+            target = resolved;
+            image = if image == null then null else toString image;
+          };
+          json = pkgs.writeText "compute-task.json" (builtins.toJSON manifest);
+        in
+        pkgs.runCommand "compute-task-${jobName}-${targetName}" { } ''
+          mkdir -p "$out"
+          cp ${json} "$out/task.json"
+          ln -s ${target.program} "$out/program"
+          ${lib.optionalString (image != null) "ln -s ${image} \"$out/image\""}
+        ''
+      ) targets
+    ) evaluated;
     computeRuntimes = lib.mapAttrs (
       _: targets:
       lib.mapAttrs (

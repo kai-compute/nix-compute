@@ -25,8 +25,10 @@ in
         type = types.attrsOf (
           types.submodule {
             options = {
-              uri = mkOption { type = types.str; };
-              sha256 = mkOption { type = types.strMatching "[a-fA-F0-9]{64}"; };
+              source = mkOption {
+                type = types.either types.package types.path;
+                description = "Immutable input file or directory, realized and cached by Nix.";
+              };
               path = mkOption {
                 type = types.str;
                 description = "Path relative to NIX_COMPUTE_INPUTS.";
@@ -51,6 +53,20 @@ in
               required = mkOption {
                 type = types.bool;
                 default = true;
+              };
+              kind = mkOption {
+                type = types.enum [
+                  "file"
+                  "directory"
+                ];
+                default = "file";
+              };
+              scope = mkOption {
+                type = types.enum [
+                  "leader"
+                  "per-node"
+                ];
+                default = "leader";
               };
             };
           }

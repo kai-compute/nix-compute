@@ -29,19 +29,28 @@
       perSystem =
         { pkgs, system, ... }:
         let
-          rustPackage = pkgs.rustPlatform.buildRustPackage {
-            pname = "nix-compute";
-            version = "0.2.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = [ pkgs.pkg-config ];
-          };
+          rustPackage =
+            pname:
+            pkgs.rustPlatform.buildRustPackage {
+              inherit pname;
+              version = "0.3.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+              nativeBuildInputs = [ pkgs.pkg-config ];
+              cargoBuildFlags = [
+                "-p"
+                pname
+              ];
+              cargoTestFlags = [ "--workspace" ];
+              meta.homepage = "https://github.com/kai-compute/nix-compute";
+            };
         in
         {
           formatter = pkgs.nixfmt;
           checks = {
             modules = import ./nix/tests.nix { inherit pkgs; };
-            rust = rustPackage;
+            rust = rustPackage "nix-compute";
+            provider = rustPackage "nix-compute-provider-reference";
           }
           // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
             oneapi-probe = (import ./nix/lib.nix { inherit (pkgs) lib; }).mkProbe {
@@ -49,10 +58,15 @@
               backend = "oneapi";
             };
           };
-          packages.default = rustPackage;
+          packages.default = rustPackage "nix-compute";
+          packages.provider-reference = rustPackage "nix-compute-provider-reference";
           apps.default = {
             type = "app";
-            program = "${rustPackage}/bin/nix-compute";
+            program = "${rustPackage "nix-compute"}/bin/nix-compute";
+          };
+          apps.provider-reference = {
+            type = "app";
+            program = "${rustPackage "nix-compute-provider-reference"}/bin/nix-compute-provider-reference";
           };
           devShells.default = pkgs.mkShell {
             packages = [

@@ -10,11 +10,11 @@ jobs:
         with:
           name: devenv
       - run: nix profile install nixpkgs#devenv
-      - run: devenv shell -- cargo fmt --check
-      - run: devenv shell -- cargo clippy --all-targets -- -D warnings
-      - run: devenv shell -- cargo test
+      - run: devenv shell -- cargo fmt --all --check
+      - run: devenv shell -- cargo clippy --workspace --all-targets -- -D warnings
+      - run: devenv shell -- cargo test --workspace
       - run: devenv shell -- python3 -m unittest discover -s tests -p 'test_*.py'
-      - run: devenv shell -- cargo build
+      - run: devenv shell -- cargo build --workspace
       - run: nix build .#checks.x86_64-linux.modules --no-link
       - run: nix build .#checks.x86_64-linux.oneapi-probe --no-link
       - name: Configure local archive imports on the test runner
@@ -25,4 +25,10 @@ jobs:
       - run: devenv shell -- bash tests/e2e.sh
         env:
           NIX_COMPUTE_TEST_OCI: "1"
+      - name: CPU OCI with Docker
+        run: devenv shell -- bash tests/e2e.sh
+        env:
+          NIX_COMPUTE_TEST_DOCKER: "1"
+      - run: devenv shell -- bash tests/distributed.sh
+      - run: devenv shell -- bash tests/cache.sh
       - run: bash tests/hardware-smoke.sh

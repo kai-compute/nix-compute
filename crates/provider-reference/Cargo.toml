@@ -1,0 +1,31 @@
+[package]
+name = "nix-compute-provider-reference"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/kai-compute/nix-compute"
+description = "Reference provider for prebuilt Nix Compute tasks"
+
+[dependencies]
+nix-compute-protocol = { path = "../protocol" }
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+semver = "1.0"
+fs2 = "0.4"
+libc = "0.2"
+signal-hook = "0.3"
+tar = "0.4"
+flate2 = "1.0"
+tempfile = "3.14"
+
+[dev-dependencies]
+nix-compute-protocol = { path = "../protocol", features = ["test-fixtures"] }

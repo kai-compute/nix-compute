@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, Read},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::AtomicBool,
@@ -181,35 +181,6 @@ pub fn check_host(target: &TargetSummary, caps: &Capabilities) -> anyhow::Result
     Ok(())
 }
 
-pub fn select(candidates: &BTreeMap<String, Result<(), String>>) -> anyhow::Result<String> {
-    let fitting: Vec<_> = candidates
-        .iter()
-        .filter(|(_, status)| status.is_ok())
-        .map(|(name, _)| name.clone())
-        .collect();
-    if fitting.len() == 1 {
-        return Ok(fitting[0].clone());
-    }
-    let detail = candidates
-        .iter()
-        .map(|(name, status)| {
-            format!(
-                "{name}: {}",
-                status
-                    .as_ref()
-                    .err()
-                    .map(String::as_str)
-                    .unwrap_or("compatible")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    anyhow::bail!(
-        "{} compatible targets; select --target explicitly. {detail}",
-        fitting.len()
-    )
-}
-
 pub struct Workspace {
     pub root: PathBuf,
     pub inputs: PathBuf,
@@ -345,7 +316,102 @@ fn archive_file(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("image archive lacks {name}")
 }
 
-pub fn load_image(archive: &Path, runtime: &str) -> anyhow::Result<String> {
+fn append_archive_bytes<W: Write>(
+    archive: &mut tar::Builder<W>,
+    path: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(bytes.len() as u64);
+    archive.append_data(&mut header, path, bytes)?;
+    Ok(())
+}
+
+fn image_with_input_links(
+    archive: &Path,
+    roots: &[PathBuf],
+) -> anyhow::Result<Option<tempfile::NamedTempFile>> {
+    let mut layer = tar::Builder::new(Vec::new());
+    let mut populated = false;
+    for root in roots {
+        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            layer.append_link(&mut header, root.strip_prefix("/")?, fs::read_link(root)?)?;
+            populated = true;
+        }
+    }
+    if !populated {
+        return Ok(None);
+    }
+    let layer = layer.into_inner()?;
+    let digest = crate::canonical::sha256_bytes(&layer);
+    let layer_path = format!("{digest}/layer.tar");
+    let mut manifest: Value = serde_json::from_slice(&archive_file(archive, "manifest.json")?)?;
+    ensure!(
+        manifest.as_array().is_some_and(|images| images.len() == 1),
+        "expected exactly one image in archive"
+    );
+    let image = &mut manifest[0];
+    let config_path = image["Config"].as_str().context("image config missing")?;
+    let mut config: Value = serde_json::from_slice(&archive_file(archive, config_path)?)?;
+    config["rootfs"]["diff_ids"]
+        .as_array_mut()
+        .context("image layer digests missing")?
+        .push(format!("sha256:{digest}").into());
+    if config.get("history").is_some() {
+        config["history"]
+            .as_array_mut()
+            .context("invalid image history")?
+            .push(serde_json::json!({"created_by": "nix-compute immutable input links"}));
+    }
+    let config = serde_json::to_vec(&config)?;
+    let config_digest = crate::canonical::sha256_bytes(&config);
+    let config_path = format!("{config_digest}.json");
+    image["Config"] = config_path.clone().into();
+    image["RepoTags"] = serde_json::json!([format!("nix-compute-inputs:{config_digest}")]);
+    let layers = image["Layers"]
+        .as_array_mut()
+        .context("image layers missing")?;
+    let mut remaining = layers
+        .iter()
+        .map(|layer| {
+            layer
+                .as_str()
+                .map(PathBuf::from)
+                .context("invalid image layer path")
+        })
+        .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+    layers.push(layer_path.clone().into());
+    let mut prepared = tempfile::NamedTempFile::new()?;
+    let mut output = tar::Builder::new(prepared.as_file_mut());
+    for entry in tar::Archive::new(archive_reader(archive)?).entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if remaining.remove(&path) {
+            output.append_data(&mut entry.header().clone(), path, &mut entry)?;
+        }
+    }
+    ensure!(remaining.is_empty(), "image archive lacks a declared layer");
+    append_archive_bytes(&mut output, &layer_path, &layer)?;
+    append_archive_bytes(&mut output, &config_path, &config)?;
+    append_archive_bytes(
+        &mut output,
+        "manifest.json",
+        &serde_json::to_vec(&manifest)?,
+    )?;
+    output.finish()?;
+    drop(output);
+    Ok(Some(prepared))
+}
+
+pub fn load_image(archive: &Path, runtime: &str, job: &ComputeJob) -> anyhow::Result<String> {
+    // A metadata-only layer preserves input links even with a read-only Docker rootfs.
+    let prepared = image_with_input_links(archive, &input_closure(job)?)?;
+    let archive = prepared.as_ref().map_or(archive, |file| file.path());
     let manifest: Value = serde_json::from_slice(&archive_file(archive, "manifest.json")?)?;
     let images = manifest
         .as_array()
@@ -370,12 +436,57 @@ pub fn load_image(archive: &Path, runtime: &str) -> anyhow::Result<String> {
     let inspected = process::capture(
         Command::new(runtime).args(["image", "inspect", "--format", "{{.Id}}", &image_id]),
         15,
+    );
+    match inspected {
+        Ok(inspected) => {
+            ensure!(
+                normalize_image_id(String::from_utf8(inspected)?.trim())? == image_id,
+                "loaded image does not match archive config digest"
+            );
+            return Ok(image_id);
+        }
+        Err(error) if runtime != "docker" => return Err(error),
+        Err(_) => {}
+    }
+    // Docker's containerd store identifies images by manifest, not config digest.
+    // Export the immutable runtime ID and verify its original config before use.
+    let tag = images[0]["RepoTags"]
+        .as_array()
+        .and_then(|tags| tags.first())
+        .and_then(Value::as_str)
+        .context("Docker image lookup requires an archive tag")?;
+    let inspected = process::capture(
+        Command::new(runtime).args(["image", "inspect", "--format", "{{.Id}}", tag]),
+        15,
     )?;
+    let runtime_id = normalize_image_id(String::from_utf8(inspected)?.trim())?;
+    let exported = tempfile::NamedTempFile::new()?;
+    let output = Command::new(runtime)
+        .args(["image", "save", "--output"])
+        .arg(exported.path())
+        .arg(&runtime_id)
+        .output()?;
     ensure!(
-        normalize_image_id(String::from_utf8(inspected)?.trim())? == image_id,
+        output.status.success(),
+        "image verification export failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved: Value = serde_json::from_slice(&archive_file(exported.path(), "manifest.json")?)?;
+    ensure!(
+        saved.as_array().is_some_and(|images| images.len() == 1),
+        "expected one exported image"
+    );
+    let config = saved[0]["Config"]
+        .as_str()
+        .context("exported image config missing")?;
+    ensure!(
+        format!(
+            "sha256:{}",
+            crate::canonical::sha256_bytes(&archive_file(exported.path(), config)?)
+        ) == image_id,
         "loaded image does not match archive config digest"
     );
-    Ok(image_id)
+    Ok(runtime_id)
 }
 
 fn normalize_image_id(value: &str) -> anyhow::Result<String> {
@@ -385,6 +496,20 @@ fn normalize_image_id(value: &str) -> anyhow::Result<String> {
         "runtime returned an invalid image ID"
     );
     Ok(format!("sha256:{}", digest.to_ascii_lowercase()))
+}
+
+fn input_closure(job: &ComputeJob) -> anyhow::Result<Vec<PathBuf>> {
+    let sources = job
+        .artifacts
+        .inputs
+        .values()
+        .map(|input| input.source.clone())
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        Ok(vec![])
+    } else {
+        nix::closure_paths(&nix::path_info(&sources)?)
+    }
 }
 
 pub fn container_args(
@@ -441,6 +566,14 @@ pub fn container_args(
     for (key, value) in environment(job, target, launch, workspace, true)? {
         args.push("--env".into());
         args.push(format!("{key}={value}"));
+    }
+    for root in input_closure(job)? {
+        if !fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            args.push(format!(
+                "--mount=type=bind,src={0},dst={0},readonly",
+                root.display()
+            ));
+        }
     }
     args.extend(launch.args.clone());
     if !launch.devices.is_empty() {
@@ -639,19 +772,90 @@ pub fn run_container(
     result
 }
 
-pub fn output_path(root: &Path, relative: &str) -> anyhow::Result<PathBuf> {
-    crate::model::relative_path(relative)?;
-    let path = root.join(relative).canonicalize()?;
-    ensure!(
-        path.starts_with(root.canonicalize()?) && path.is_file(),
-        "output must be a regular file inside the output directory"
-    );
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_link_image_preserves_layers_and_has_a_stable_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("linked-input");
+        let target = PathBuf::from(format!("../{}/inner", "x".repeat(150)));
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let mut base_layer = tar::Builder::new(Vec::new());
+        append_archive_bytes(&mut base_layer, "existing", b"original image data").unwrap();
+        let base_layer = base_layer.into_inner().unwrap();
+        let config = serde_json::json!({
+            "architecture": "amd64", "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", crate::canonical::sha256_bytes(&base_layer))]},
+            "history": [{"created_by": "original image"}],
+            "config": {"Entrypoint": ["/existing"]}
+        });
+        let manifest = serde_json::json!([{"Config": "config.json", "Layers": ["base/layer.tar"], "RepoTags": ["original:job"]}]);
+        let archive = dir.path().join("image.tar");
+        let mut output = tar::Builder::new(fs::File::create(&archive).unwrap());
+        append_archive_bytes(&mut output, "base/layer.tar", &base_layer).unwrap();
+        append_archive_bytes(
+            &mut output,
+            "config.json",
+            &serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        append_archive_bytes(
+            &mut output,
+            "manifest.json",
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        output.finish().unwrap();
+        drop(output);
+        assert!(image_with_input_links(&archive, &[]).unwrap().is_none());
+        let prepared = image_with_input_links(&archive, std::slice::from_ref(&root))
+            .unwrap()
+            .unwrap();
+        let repeated = image_with_input_links(&archive, std::slice::from_ref(&root))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(prepared.path()).unwrap(),
+            fs::read(repeated.path()).unwrap()
+        );
+        assert_eq!(
+            archive_file(prepared.path(), "base/layer.tar").unwrap(),
+            base_layer
+        );
+        let manifest: Value =
+            serde_json::from_slice(&archive_file(prepared.path(), "manifest.json").unwrap())
+                .unwrap();
+        let config_bytes =
+            archive_file(prepared.path(), manifest[0]["Config"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            manifest[0]["Config"],
+            format!("{}.json", crate::canonical::sha256_bytes(&config_bytes))
+        );
+        let prepared_config: Value = serde_json::from_slice(&config_bytes).unwrap();
+        assert_eq!(prepared_config["config"], config["config"]);
+        assert_eq!(
+            prepared_config["rootfs"]["diff_ids"][0],
+            config["rootfs"]["diff_ids"][0]
+        );
+        let layer =
+            archive_file(prepared.path(), manifest[0]["Layers"][1].as_str().unwrap()).unwrap();
+        assert_eq!(
+            prepared_config["rootfs"]["diff_ids"][1],
+            format!("sha256:{}", crate::canonical::sha256_bytes(&layer))
+        );
+        let mut layer_archive = tar::Archive::new(layer.as_slice());
+        let entries = layer_archive
+            .entries()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].header().entry_type().is_symlink());
+        assert_eq!(entries[0].path().unwrap(), root.strip_prefix("/").unwrap());
+        assert_eq!(entries[0].link_name().unwrap().unwrap(), target);
+    }
+
     #[test]
     fn docker_and_podman_image_ids_use_the_same_digest() {
         let digest = "a".repeat(64);
@@ -661,28 +865,6 @@ mod tests {
         );
         assert!(normalize_image_id("nix-compute:job").is_err());
     }
-    #[test]
-    fn ambiguity_and_no_match_are_errors() {
-        let mut candidates = BTreeMap::from([("cpu".into(), Ok(())), ("cuda".into(), Ok(()))]);
-        assert!(select(&candidates)
-            .unwrap_err()
-            .to_string()
-            .contains("2 compatible"));
-        candidates.insert("cuda".into(), Err("no GPU".into()));
-        assert_eq!(select(&candidates).unwrap(), "cpu");
-        candidates.insert("cpu".into(), Err("no runtime".into()));
-        assert!(select(&candidates)
-            .unwrap_err()
-            .to_string()
-            .contains("no GPU"));
-    }
-    #[test]
-    fn artifact_symlinks_cannot_escape_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("escape")).unwrap();
-        assert!(output_path(dir.path(), "escape").is_err());
-    }
-
     fn shell() -> String {
         String::from_utf8(
             Command::new("sh")
@@ -792,6 +974,22 @@ mod tests {
             let start = if timeout { "sleep 5" } else { "exit 9" };
             fs::write(&runtime, format!("#!{}\ncase \"$1\" in\ncreate) exit 0;;\nstart) {start};;\nrm) touch '{}' ;;\nesac\n", shell(), marker.display())).unwrap();
             fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+            // Concurrent test forks can briefly inherit the script's writer before exec.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match Command::new(&runtime).arg("create").status() {
+                    Err(error)
+                        if error.raw_os_error() == Some(libc::ETXTBSY)
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    result => {
+                        assert!(result.unwrap().success());
+                        break;
+                    }
+                }
+            }
             target.summary.execution.timeout_seconds = Some(1);
             let code = run_container(
                 &job,
@@ -812,7 +1010,7 @@ mod tests {
     fn container_device_ordinals_are_remapped_by_identity() {
         let (_, mut target) = crate::model::fixture();
         let fixtures: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/inventories.json")).unwrap();
+            serde_json::from_str(include_str!("../../../tests/fixtures/inventories.json")).unwrap();
         let mut host = crate::accelerator::parse_inventory(
             &serde_json::to_vec(&fixtures["rocm"]).unwrap(),
             "rocm",

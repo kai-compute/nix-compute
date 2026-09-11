@@ -59,6 +59,7 @@ pub struct Accelerator {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
+    pub nodes: u32,
     pub cpu_cores: Option<u32>,
     pub memory_mib: Option<u64>,
     pub enforce: bool,
@@ -83,8 +84,7 @@ pub struct Artifacts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputArtifact {
-    pub uri: String,
-    pub sha256: String,
+    pub source: String,
     pub path: String,
 }
 
@@ -94,6 +94,8 @@ pub struct OutputArtifact {
     pub path: String,
     pub destination: Option<String>,
     pub required: bool,
+    pub kind: String,
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,121 @@ pub struct OutputArtifact {
 pub struct Reproducibility {
     pub contract: String,
     pub seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Task {
+    pub schema_version: u32,
+    pub source: String,
+    pub job: ComputeJob,
+    pub target: Target,
+    pub image: Option<String>,
+}
+
+impl Task {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.schema_version == 3,
+            "unsupported task schema; rebuild with schema v3"
+        );
+        store_path(&self.source)?;
+        self.job.validate()?;
+        self.target.validate()?;
+        ensure!(
+            self.job.targets.len() == 1,
+            "a built task must contain one selected target"
+        );
+        let summary = self
+            .job
+            .targets
+            .get(&self.target.summary.name)
+            .context("selected target missing")?;
+        ensure!(
+            serde_json::to_value(summary)? == serde_json::to_value(&self.target.summary)?,
+            "task target summary mismatch"
+        );
+        ensure!(
+            self.image.is_some() == (summary.executor == "oci"),
+            "task image/executor mismatch"
+        );
+        if let Some(image) = &self.image {
+            store_path(image)?;
+        }
+        Ok(())
+    }
+
+    pub fn load(root: &Path) -> anyhow::Result<Self> {
+        let manifest = root.join("task.json");
+        ensure!(
+            std::fs::symlink_metadata(&manifest)
+                .context("expected a built computeTasks output containing task.json")?
+                .file_type()
+                .is_file(),
+            "task.json must be a regular file within the task output"
+        );
+        let task: Self = serde_json::from_slice(
+            &std::fs::read(manifest)
+                .context("expected a built computeTasks output containing task.json")?,
+        )?;
+        task.validate()?;
+        Ok(task)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeContext {
+    pub run_id: String,
+    pub node_id: String,
+    pub node_rank: u32,
+    pub node_count: u32,
+    pub master_addr: String,
+    pub master_port: u16,
+}
+
+impl NodeContext {
+    pub fn validate(&self, target: &TargetSummary) -> anyhow::Result<()> {
+        ensure!(
+            safe_name(&self.run_id) && safe_name(&self.node_id),
+            "invalid run or node identity"
+        );
+        ensure!(
+            self.node_count == target.resources.nodes && self.node_rank < self.node_count,
+            "node context does not match task topology"
+        );
+        ensure!(
+            !self.master_addr.is_empty()
+                && self
+                    .master_addr
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".-:".contains(&c))
+                && self.master_port > 0,
+            "invalid rendezvous address or port"
+        );
+        Ok(())
+    }
+
+    pub fn environment(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("NIX_COMPUTE_NODE_RANK".into(), self.node_rank.to_string()),
+            ("NIX_COMPUTE_NODE_COUNT".into(), self.node_count.to_string()),
+            ("NIX_COMPUTE_MASTER_ADDR".into(), self.master_addr.clone()),
+            (
+                "NIX_COMPUTE_MASTER_PORT".into(),
+                self.master_port.to_string(),
+            ),
+        ])
+    }
+}
+
+pub fn store_path(path: &str) -> anyhow::Result<()> {
+    let relative = path
+        .strip_prefix("/nix/store/")
+        .context("expected Nix store path")?;
+    relative_path(relative)?;
+    ensure!(!path.contains([',', ':']), "invalid Nix store path");
+    Ok(())
 }
 
 pub fn safe_name(name: &str) -> bool {
@@ -131,8 +248,8 @@ pub fn digest_valid(value: &str) -> bool {
 impl ComputeJob {
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
-            self.schema_version == 2,
-            "unsupported schema; migrate to compute.jobs.<job>.targets.<target> and perTarget"
+            self.schema_version == 3,
+            "unsupported schema; migrate inputs to source and rebuild with schema v3"
         );
         ensure!(safe_name(&self.name), "invalid job name");
         ensure!(
@@ -147,7 +264,7 @@ impl ComputeJob {
         for (name, input) in &self.artifacts.inputs {
             ensure!(safe_name(name), "invalid input name {name}");
             relative_path(&input.path)?;
-            ensure!(digest_valid(&input.sha256), "invalid input digest {name}");
+            store_path(&input.source).with_context(|| format!("invalid input source {name}"))?;
             paths.push(Path::new(&input.path));
         }
         for (i, left) in paths.iter().enumerate() {
@@ -162,6 +279,14 @@ impl ComputeJob {
         for (name, output) in &self.artifacts.outputs {
             ensure!(safe_name(name), "invalid output name {name}");
             relative_path(&output.path)?;
+            ensure!(
+                matches!(output.kind.as_str(), "file" | "directory"),
+                "invalid output kind"
+            );
+            ensure!(
+                matches!(output.scope.as_str(), "leader" | "per-node"),
+                "invalid output scope"
+            );
         }
         for (name, target) in &self.targets {
             ensure!(name == &target.name, "target name mismatch");
@@ -205,6 +330,11 @@ impl TargetSummary {
         ensure!(
             self.execution.timeout_seconds != Some(0),
             "timeout must be positive"
+        );
+        ensure!(self.resources.nodes > 0, "nodes must be positive");
+        ensure!(
+            self.resources.nodes == 1 || self.execution.network == "host",
+            "multi-node tasks require network = host for peer connectivity"
         );
         ensure!(
             self.resources.cpu_cores != Some(0) && self.resources.memory_mib != Some(0),
@@ -274,10 +404,7 @@ impl TargetSummary {
 impl Target {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.summary.validate()?;
-        ensure!(
-            self.program.starts_with("/nix/store/"),
-            "program must be a Nix store derivation output"
-        );
+        store_path(&self.program)?;
         ensure!(
             self.entrypoint
                 .first()
@@ -285,6 +412,13 @@ impl Target {
                 && self.entrypoint.iter().all(|s| !s.contains('\0')),
             "entrypoint must use a Nix store executable"
         );
+        store_path(&self.entrypoint[0])?;
+        if let Some(probe) = &self.probe {
+            store_path(probe)?;
+        }
+        for path in &self.runtime_paths {
+            store_path(path)?;
+        }
         ensure!(
             (self.summary.executor == "oci") == self.image_output.is_some(),
             "image/executor mismatch"
@@ -310,9 +444,10 @@ impl Target {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn fixture() -> (ComputeJob, Target) {
-    let value: Value = serde_json::from_str(include_str!("../tests/fixtures/cpu.json")).unwrap();
+    let value: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/cpu.json")).unwrap();
     (
         serde_json::from_value(value["job"].clone()).unwrap(),
         serde_json::from_value(value["target"].clone()).unwrap(),
@@ -322,6 +457,31 @@ pub fn fixture() -> (ComputeJob, Target) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_manifest_must_not_follow_external_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("task");
+        std::fs::create_dir(&root).unwrap();
+        let (job, target) = fixture();
+        let task = Task {
+            schema_version: 3,
+            source: "/nix/store/fixture-source".into(),
+            job,
+            target,
+            image: None,
+        };
+        let external = dir.path().join("external.json");
+        std::fs::write(&external, serde_json::to_vec(&task).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&external, root.join("task.json")).unwrap();
+        assert!(Task::load(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("regular file"));
+        std::fs::remove_file(root.join("task.json")).unwrap();
+        std::fs::copy(external, root.join("task.json")).unwrap();
+        Task::load(&root).unwrap();
+    }
+
     #[test]
     fn artifact_paths_are_relative_components() {
         for path in ["../x", "a/../../b", "/tmp/x", "", "a\\b", "./x"] {
@@ -333,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_contract_rejects_ignored_or_incompatible_requirements() {
+    fn v3_contract_rejects_ignored_or_incompatible_requirements() {
         let (mut job, mut target) = fixture();
         job.validate().unwrap();
         target.validate().unwrap();
@@ -351,5 +511,58 @@ mod tests {
             .env
             .insert("NIX_COMPUTE_OUTPUTS".into(), "/escape".into());
         assert!(target.validate().is_err());
+    }
+
+    #[test]
+    fn topology_and_node_context_are_validated_together() {
+        let (_, mut target) = fixture();
+        target.summary.resources.nodes = 2;
+        target.validate().unwrap();
+        let mut node = NodeContext {
+            run_id: "run".into(),
+            node_id: "worker".into(),
+            node_rank: 1,
+            node_count: 2,
+            master_addr: "10.0.0.1".into(),
+            master_port: 29500,
+        };
+        node.validate(&target.summary).unwrap();
+        assert_eq!(node.environment()["NIX_COMPUTE_NODE_COUNT"], "2");
+        node.node_rank = 2;
+        assert!(node.validate(&target.summary).is_err());
+        node.node_rank = 0;
+        node.node_count = 1;
+        assert!(node.validate(&target.summary).is_err());
+        target.summary.execution.network = "none".into();
+        assert!(target.validate().is_err());
+        target.summary.resources.nodes = 0;
+        assert!(target.validate().is_err());
+    }
+
+    #[test]
+    fn task_rejects_unselected_target_old_schema_and_escaping_inputs() {
+        let (job, target) = fixture();
+        let mut task = Task {
+            schema_version: 3,
+            source: "/nix/store/fixture-source".into(),
+            job,
+            target,
+            image: None,
+        };
+        task.validate().unwrap();
+        task.schema_version = 2;
+        assert!(task.validate().is_err());
+        task.schema_version = 3;
+        task.target.summary.resources.nodes = 2;
+        assert!(task.validate().is_err());
+        task.target.summary.resources.nodes = 1;
+        task.job.artifacts.inputs.insert(
+            "data".into(),
+            InputArtifact {
+                source: "/nix/store/../secret".into(),
+                path: "data".into(),
+            },
+        );
+        assert!(task.validate().is_err());
     }
 }

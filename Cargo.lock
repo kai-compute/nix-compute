@@ -581,7 +581,31 @@ dependencies = [
 
 [[package]]
 name = "nix-compute"
-version = "0.2.0"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix-compute-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nix-compute-protocol"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "nix-compute-provider-reference"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -591,6 +615,7 @@ dependencies = [
  "fs2",
  "hex",
  "libc",
+ "nix-compute-protocol",
  "rand_core",
  "semver",
  "serde",

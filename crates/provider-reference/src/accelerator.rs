@@ -44,7 +44,16 @@ pub struct Launch {
 
 pub struct Allocation {
     pub launch: Launch,
-    _locks: Vec<File>,
+    _locks: Vec<DeviceLock>,
+}
+
+struct DeviceLock(File);
+
+impl Drop for DeviceLock {
+    fn drop(&mut self) {
+        // A concurrent fork may still hold a duplicate of this open file description.
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 pub trait Adapter: Sync {
@@ -212,7 +221,7 @@ pub fn allocate(
             .open(lock_root.join(filename))?;
         match file.try_lock_exclusive() {
             Ok(()) => {
-                locks.push(file);
+                locks.push(DeviceLock(file));
                 devices.push(device);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -463,7 +472,7 @@ mod tests {
     fn allocation_is_exclusive_and_released_on_drop() {
         let (_, mut target) = crate::model::fixture();
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/inventories.json")).unwrap();
+            serde_json::from_str(include_str!("../../../tests/fixtures/inventories.json")).unwrap();
         let inventory =
             parse_inventory(&serde_json::to_vec(&fixtures["cuda"]).unwrap(), "cuda").unwrap();
         target.summary.accelerator = Accelerator {
@@ -478,15 +487,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = allocate(&target, &inventory, dir.path()).unwrap();
         assert!(allocate(&target, &inventory, dir.path()).is_err());
+        let inherited = first._locks[0].0.try_clone().unwrap();
         drop(first);
         assert!(allocate(&target, &inventory, dir.path()).is_ok());
+        drop(inherited);
         fs::write(dir.path().join("quarantine.json"), "{}").unwrap();
         assert!(allocate(&target, &inventory, dir.path()).is_err());
     }
     #[test]
     fn six_backends_match_and_configure_fixture_devices() {
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/inventories.json")).unwrap();
+            serde_json::from_str(include_str!("../../../tests/fixtures/inventories.json")).unwrap();
         for backend in ["cuda", "rocm", "tpu", "metal", "cann", "oneapi"] {
             let inventory =
                 parse_inventory(&serde_json::to_vec(&fixtures[backend]).unwrap(), backend).unwrap();
@@ -528,7 +539,7 @@ mod tests {
     #[test]
     fn probe_rejects_unknown_capabilities_and_duplicate_identity() {
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/inventories.json")).unwrap();
+            serde_json::from_str(include_str!("../../../tests/fixtures/inventories.json")).unwrap();
         let mut inventory = fixtures["cuda"].clone();
         inventory["devices"][0]["driver_version"] = "unknown".into();
         assert!(parse_inventory(&serde_json::to_vec(&inventory).unwrap(), "cuda").is_err());
