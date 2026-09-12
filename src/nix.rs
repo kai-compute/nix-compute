@@ -62,7 +62,7 @@ impl NixRuntime {
     fn flake(&mut self, reference: &str) -> anyhow::Result<NixValue> {
         let mut parse_flags = FlakeReferenceParseFlags::new(&self.flake_settings)?;
         parse_flags.set_preserve_relative_paths(true)?;
-        if let Some(base) = path_reference_base(reference) {
+        if let Some(base) = path_reference_root(reference) {
             parse_flags.set_base_directory(base.to_str().context("flake path is not UTF-8")?)?;
         }
         let (flake_ref, fragment) = FlakeReference::parse_with_fragment(
@@ -92,11 +92,14 @@ impl NixRuntime {
         let value = self.eval(&format!(
             "builtins.fetchTree {{ type = \"path\"; path = {path}; }}"
         ))?;
-        let archived = self.json(&value)?;
-        Ok(archived
-            .as_str()
-            .context("Nix fetchTree did not return a store path")?
-            .to_string())
+        let output = self
+            .eval_state
+            .require_attrs_select_opt(&value, "outPath")?
+            .unwrap_or(value);
+        if let Ok(path) = self.eval_state.require_path_string(&output) {
+            return Ok(path);
+        }
+        self.eval_state.require_string(&output)
     }
 
     fn json(&mut self, value: &NixValue) -> anyhow::Result<serde_json::Value> {
@@ -119,6 +122,18 @@ impl NixRuntime {
 }
 
 fn path_reference_base(reference: &str) -> Option<std::path::PathBuf> {
+    let query = reference
+        .strip_prefix("path:")?
+        .split_once('?')
+        .map_or("", |(_, query)| query);
+    let mut path = path_reference_root(reference)?;
+    if let Some(dir) = query.split('&').find_map(|part| part.strip_prefix("dir=")) {
+        path.push(dir);
+    }
+    path.exists().then(|| path.canonicalize().unwrap_or(path))
+}
+
+fn path_reference_root(reference: &str) -> Option<std::path::PathBuf> {
     let path = reference.strip_prefix("path:")?.split('?').next()?;
     let path = Path::new(path);
     let path = if path.is_absolute() {
@@ -161,11 +176,10 @@ impl Selector {
                 "(builtins.getFlake {}).sourceInfo",
                 serde_json::to_string(&self.flake)?
             ))?;
-            let source = nix.json(&source_value)?;
-            source["outPath"]
-                .as_str()
-                .context("Nix flake sourceInfo has no outPath")?
-                .to_string()
+            let out_path = nix
+                .eval_state
+                .require_attrs_select(&source_value, "outPath")?;
+            nix.eval_state.require_path_string(&out_path)?
         };
         let lock: Value = serde_json::from_slice(
             &fs::read(Path::new(&root).join("flake.lock"))
